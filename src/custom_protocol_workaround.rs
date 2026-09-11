@@ -73,8 +73,10 @@ mod tests {
     // External https URLs with an unrelated host must NOT be matched.
     // (Note: the upstream matcher is prefix-based, so a URL like
     // `https://tauri.com/` does match protocol `tauri` — that is upstream
-    // behavior on Windows/Android and is kept as-is; OHOS does its host
-    // check on the ArkTS side and never calls this function.)
+    // behavior on Windows/Android and is kept as-is. OHOS uses this same
+    // matcher in `dispatch_https_intercept_sync`; its ArkTS side applies the
+    // equivalent gate by checking the first-dot host segment against the
+    // seeded protocol set.)
     assert!(!is_work_around_uri("https://example.com/page", "https", "tauri"));
     // Only https://tauri.localhost/... matches
     assert!(is_work_around_uri("https://tauri.localhost/page", "https", "tauri"));

@@ -238,7 +238,9 @@ type SharedProtocolHandler = Arc<SendSyncBox<ProtocolHandler>>;
 
 // ─── InnerWebView ───────────────────────────────────────────────────────────────
 
-pub struct InnerWebView {
+/// Crate-private on purpose (upstream never exposes `InnerWebView` on any
+/// platform); re-exported types live in `src/lib.rs`'s targeted `pub use`.
+pub(crate) struct InnerWebView {
   id: String,
   /// Async-ready handle. Set when `WebviewClient::create()` completes.
   /// Uses `OnceLock` — set exactly once when create finishes.
@@ -336,7 +338,6 @@ impl InnerWebView {
       drag_drop_overlay,
       custom_protocols.len()
     );
-    log::info!("[WRY OHOS DBG] build: window_id={}", window_id);
 
     let client = WebviewClient::from_bridge(bridge_runtime);
     let runtime = BridgeExecutor::new();
@@ -437,7 +438,6 @@ impl InnerWebView {
           // spawning a duplicate dialog. Returning true here would tell ArkWeb
           // to ALSO open a popup, which is wrong (and the popup controller has
           // no synchronous Web host, risking a UI-thread block).
-          #[cfg(not(any(target_os = "android", target_os = "ios")))]
           crate::NewWindowResponse::Create { .. } => false,
         }
       });
@@ -571,9 +571,7 @@ impl InnerWebView {
     // 5. Build create request
     let initial_bounds = bounds.unwrap_or_default();
 
-    let bg_color_str = background_color.map(|c| {
-      format!("#{:02X}{:02X}{:02X}{:02X}", c.3, c.0, c.1, c.2)
-    });
+    let bg_color_str = background_color.map(rgba_to_argb_hex);
 
     // ArkWeb's `javaScriptOnDocumentStart` only injects a `ScriptItem` whose
     // `scriptRules` array matches the document origin. An EMPTY array matches
@@ -665,11 +663,7 @@ impl InnerWebView {
       };
       create_req = create_req.url(url);
       if let Some(headers) = initial_headers {
-        let header_map: std::collections::BTreeMap<String, String> = headers
-          .iter()
-          .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
-          .collect();
-        create_req.headers = Some(header_map);
+        create_req.headers = Some(headers_to_btree(&headers));
       }
     }
 
@@ -691,7 +685,6 @@ impl InnerWebView {
     }
     if window_id != 0 {
       create_req.window_id = Some(window_id);
-      log::info!("[WRY OHOS DBG] create_req.window_id set to Some({})", window_id);
     }
     if let Some(user_agent) = user_agent {
       create_req.user_agent = Some(user_agent);
@@ -723,6 +716,7 @@ impl InnerWebView {
     let pending_ops_for_create = pending_ops.clone();
     let creation_error_for_create = creation_error.clone();
     let runtime_for_create = runtime.clone();
+    let id_for_rollback = id.clone();
 
     runtime.spawn(async move {
       let result = client_for_create.create(create_req).await;
@@ -758,6 +752,22 @@ impl InnerWebView {
           *creation_error_for_create.lock().unwrap() = Some(error_str);
           // Queued ops can never execute — drop them.
           guard.clear();
+          // Roll back this attempt's entries from the process-global
+          // registries (callbacks / ipc proxy / per-webview protocol
+          // handlers). They were registered before the create was spawned
+          // and nothing will ever consume them now — without this they leak
+          // on every failed create. Process-wide scheme declarations are
+          // intentionally kept (shared across webviews, idempotent).
+          drop(guard);
+          if let Err(rollback_err) =
+            client_for_create.rollback_registrations(&id_for_rollback)
+          {
+            log::warn!(
+              "[wry] rollback of registry entries for failed create '{}' failed: {}",
+              id_for_rollback,
+              rollback_err
+            );
+          }
         }
       }
     });
@@ -904,10 +914,7 @@ impl InnerWebView {
   }
 
   pub fn set_background_color(&self, background_color: RGBA) -> Result<()> {
-    let color_str = format!(
-      "#{:02X}{:02X}{:02X}{:02X}",
-      background_color.3, background_color.0, background_color.1, background_color.2
-    );
+    let color_str = rgba_to_argb_hex(background_color);
     self.dispatch_or_queue(PendingOp::SetBackgroundColor(color_str))?;
     Ok(())
   }
@@ -996,10 +1003,7 @@ impl InnerWebView {
   }
 
   pub fn load_url_with_headers(&self, url: &str, headers: http::HeaderMap) -> Result<()> {
-    let header_map: std::collections::BTreeMap<String, String> = headers
-      .iter()
-      .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
-      .collect();
+    let header_map = headers_to_btree(&headers);
     self.dispatch_or_queue(PendingOp::LoadUrlWithHeaders(
       url.to_string(),
       header_map,
@@ -1047,6 +1051,27 @@ impl InnerWebView {
   }
 
   // Pattern C: cached
+  /// Returns the webview bounds (logical units, as passed to the builder or
+  /// [`Self::set_bounds`]).
+  ///
+  /// # OHOS unit contract
+  ///
+  /// [`Self::set_bounds`] forwards values to the ArkTS bridge with
+  /// `to_logical::<f64>(1.0)` — i.e. the number is handed to ArkUI **vp**
+  /// unchanged, which encodes a full-stack "physical px == vp" (scale factor
+  /// 1) assumption between tauri's logical coordinates and ArkUI's vp units.
+  /// On devices with a DPI different from 1 this contract needs an explicit
+  /// decision before reuse; it currently matches what tauri-runtime-wry
+  /// passes down on OHOS.
+  ///
+  /// # Cache semantics
+  ///
+  /// The value is cache-only: written at creation (builder bounds) and on
+  /// every `set_bounds`. Window resizes keep it fresh through the runtime's
+  /// autoresize path (tauri-runtime-wry re-issues `set_bounds` on window
+  /// resize, which writes this cache). ArkUI-initiated layout changes are not
+  /// observed — no bridge writeback exists — because they do not occur under
+  /// the tauri app model, where only the runtime moves webviews.
   pub fn bounds(&self) -> Result<Rect> {
     Ok(*self.bounds_cache.lock().unwrap())
   }
@@ -1075,9 +1100,12 @@ impl InnerWebView {
     Ok(())
   }
 
+  /// Removes this child webview from the ArkTS side. Idempotent — the first
+  /// caller wins via the `disposed` swap; `Drop` funnels through here too, so
+  /// the dispatch result is deliberately ignored (on the Drop path a creation
+  /// failure is already logged and there is nothing to propagate to).
   pub fn dispose_child(&self) {
     if self.is_child && !self.disposed.swap(true, Ordering::SeqCst) {
-      // Drop path: creation failure is already logged; nothing to propagate to.
       let _ = self.dispatch_or_queue(PendingOp::Remove);
     }
   }
@@ -1096,23 +1124,40 @@ impl InnerWebView {
 
 impl Drop for InnerWebView {
   fn drop(&mut self) {
-    if self.is_child && !self.disposed.swap(true, Ordering::SeqCst) {
-      // Drop path: creation failure is already logged; nothing to propagate to.
-      let _ = self.dispatch_or_queue(PendingOp::Remove);
-    }
+    self.dispose_child();
   }
 }
 
+// ─── ArkWeb engine version ──────────────────────────────────────────────────────
+
+/// Returns the active ArkWeb engine version, e.g. `"M132"` / `"M132 (evergreen)"`.
+///
+/// Delegates to `openharmony-ability-plugin-webview::arkweb_engine_version`,
+/// which reads `OH_NativeArkWeb_GetActiveWebEngineVersion` from `libohweb.so`
+/// (see that function's docs for the CAPI/dlopen rationale).
+///
+/// This is deliberately NOT a bridge round-trip: the primary caller
+/// (tauri-runtime-wry's `webview_runtime_installed` probe in `Wry::new`)
+/// runs during app bootstrap — synchronously inside the NAPI `openharmony()`
+/// entry on the ArkTS main thread — so a bridge call (whose ArkTS handler
+/// needs that same thread) would deadlock. The C API reads the same engine
+/// state with no thread requirements.
 pub fn platform_webview_version() -> Result<String> {
-  Ok("1.0.0".to_string())
+  openharmony_ability_plugin_webview::arkweb_engine_version()
+    .map_err(|e| Error::OpenHarmonyWebviewError(e.to_string()))
 }
 
 // ─── https intercept ─────────────────────────────────────────────────────────────
 
 /// Synchronously dispatches an https intercept request to the matching custom protocol handler.
 ///
-/// The URL has the form `https://<protocol>.localhost/<path>`. This function extracts the
-/// protocol name, reverts the URL to `<protocol>://localhost/<path>`, builds a `Request`,
+/// The URL has the form `https://<protocol>.<host>/<path>` (the tauri default
+/// host is `.localhost`, but the matcher is host-agnostic — any host matches,
+/// mirroring upstream Windows/Android semantics). This function matches the
+/// URL against the registered protocols using
+/// [`custom_protocol_workaround::is_work_around_uri`], reverts it to
+/// `<protocol>://<host>/<path>` with
+/// [`custom_protocol_workaround::revert_uri_work_around`], builds a `Request`,
 /// and calls the handler with a `RequestAsyncResponder`.
 ///
 /// **Threading model**: This runs on the NAPI main thread via `invokeNativeSync`. The handler
@@ -1136,33 +1181,39 @@ fn dispatch_https_intercept_sync(
   webview_id: &str,
   protocols: &HashMap<String, SharedProtocolHandler>,
 ) -> WebviewHttpsInterceptResponse {
-  log::info!("[wry https-intercept] enter: url={} webview_id={}", url, webview_id);
+  log::debug!("[wry https-intercept] enter: url={} webview_id={}", url, webview_id);
 
-  // Extract protocol name from `https://<protocol>.localhost/...`
-  let protocol = match extract_protocol_from_https_url(url) {
-    Some(p) => p,
+  // Match a registered protocol with the upstream workaround matcher
+  // (`{scheme}://{protocol}.` prefix — host-agnostic). Only registered
+  // protocols can match, so URLs like `https://<unknown>.localhost/…` fall
+  // through to passthrough. This closes the gap the old `.localhost`-only
+  // extractor had: a rewritten `https://asset.mydomain/x` now dispatches to
+  // the `asset` handler instead of silently dropping the request.
+  let (protocol, callback, original_url) = match protocols
+    .iter()
+    .find(|(protocol, _)| custom_protocol_workaround::is_work_around_uri(url, "https", protocol))
+  {
+    Some((protocol, callback)) => (
+      protocol.clone(),
+      Arc::clone(callback),
+      custom_protocol_workaround::revert_uri_work_around(url, "https", protocol),
+    ),
     None => {
-      log::info!("[wry https-intercept] passthrough: no protocol extracted from url={}", url);
+      // No registered protocol matches — ordinary external https traffic.
+      // The normal case, so debug rather than warn.
+      log::debug!(
+        "[wry https-intercept] passthrough: no registered protocol matches url={}",
+        url
+      );
       return WebviewHttpsInterceptResponse::passthrough();
     }
   };
-  log::info!("[wry https-intercept] extracted protocol='{}' from url={}", protocol, url);
-
-  let callback = match protocols.get(protocol) {
-    Some(c) => Arc::clone(c),
-    None => {
-      log::warn!("[wry https-intercept] passthrough: protocol '{}' not in registered set ({} protocols registered)", protocol, protocols.len());
-      return WebviewHttpsInterceptResponse::passthrough();
-    }
-  };
-
-  // Revert URL: `https://<protocol>.localhost/<path>` → `<protocol>://localhost/<path>`
-  let original_url = url.replacen(
-    &format!("https://{}.", protocol),
-    &format!("{}://", protocol),
-    1,
+  log::debug!(
+    "[wry https-intercept] matched protocol='{}': {} → {}",
+    protocol,
+    url,
+    original_url
   );
-  log::info!("[wry https-intercept] reverted url: {} → {}", url, original_url);
 
   let request = match Request::builder().uri(&original_url).body(Vec::new()) {
     Ok(r) => r,
@@ -1183,13 +1234,19 @@ fn dispatch_https_intercept_sync(
     *response_cell_clone.lock().unwrap() = Some(resp);
   });
 
-  log::info!("[wry https-intercept] calling protocol handler for protocol='{}'...", protocol);
+  log::debug!(
+    "[wry https-intercept] calling protocol handler for protocol='{}'...",
+    protocol
+  );
   (callback.0)(
     webview_id,
     request,
     RequestAsyncResponder { responder },
   );
-  log::info!("[wry https-intercept] protocol handler returned for protocol='{}'", protocol);
+  log::debug!(
+    "[wry https-intercept] protocol handler returned for protocol='{}'",
+    protocol
+  );
 
   // Check if the handler called the responder synchronously (inline).
   // This is the expected path for the default tauri asset handler.
@@ -1207,7 +1264,7 @@ fn dispatch_https_intercept_sync(
         .unwrap_or("text/html")
         .to_string();
       let body = response.body().to_vec();
-      log::info!(
+      log::debug!(
         "[wry https-intercept] success: protocol='{}' status={} mime={} body_len={}",
         protocol, status, mime_type, body.len()
       );
@@ -1235,15 +1292,9 @@ fn dispatch_https_intercept_sync(
   }
 }
 
-/// Extracts the protocol name from a URL like `https://myproto.localhost/path`.
-fn extract_protocol_from_https_url(url: &str) -> Option<&str> {
-  let after_scheme = url.strip_prefix("https://")?;
-  let protocol_end = after_scheme.find(".localhost")?;
-  Some(&after_scheme[..protocol_end])
-}
-
 /// Returns true if any custom protocols are registered (used for https scheme logic).
-#[allow(dead_code)]
+/// Test-only: production code gates on `use_https && !protocols.is_empty()` inline.
+#[cfg(test)]
 fn custom_protocols_use_https(protocols: &HashMap<String, SharedProtocolHandler>) -> bool {
   !protocols.is_empty()
 }
@@ -1258,6 +1309,23 @@ fn rewrite_https_url_if_matching(url: &str, custom_protocols: &HashMap<String, S
     }
   }
   url.to_string()
+}
+
+/// Formats an RGBA color as the ArkWeb `#AARRGGBB` string (alpha first).
+fn rgba_to_argb_hex(color: RGBA) -> String {
+  format!(
+    "#{:02X}{:02X}{:02X}{:02X}",
+    color.3, color.0, color.1, color.2
+  )
+}
+
+/// Converts an `http::HeaderMap` into the bridge's `BTreeMap<String, String>`
+/// form (header names as strings; non-UTF-8 values become empty).
+fn headers_to_btree(headers: &http::HeaderMap) -> std::collections::BTreeMap<String, String> {
+  headers
+    .iter()
+    .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+    .collect()
 }
 
 /// Format a `cookie::Cookie` as a Set-Cookie value string (RFC 6265).
@@ -1308,26 +1376,6 @@ mod tests {
   fn format_set_cookie_value_minimal() {
     let cookie = Cookie::build(("k", "v")).build();
     assert_eq!(format_set_cookie_value(&cookie), "k=v");
-  }
-
-  #[test]
-  fn extract_protocol_from_https_url_works() {
-    assert_eq!(
-      extract_protocol_from_https_url("https://myproto.localhost/path/to/page"),
-      Some("myproto")
-    );
-    assert_eq!(
-      extract_protocol_from_https_url("https://tauri.localhost"),
-      Some("tauri")
-    );
-    assert_eq!(
-      extract_protocol_from_https_url("https://example.com"),
-      None
-    );
-    assert_eq!(
-      extract_protocol_from_https_url("myproto://localhost/path"),
-      None
-    );
   }
 
   #[test]
@@ -1392,26 +1440,41 @@ mod tests {
   }
 
   #[test]
-  fn extract_protocol_from_https_url_with_long_path() {
-    assert_eq!(
-      extract_protocol_from_https_url("https://myproto.localhost/a/b/c/d?e=f#g"),
-      Some("myproto")
+  fn https_intercept_non_localhost_host_is_handled() {
+    // Host-agnostic matching (upstream `is_work_around_uri` semantics):
+    // `https://asset.mydomain/x` must dispatch to the `asset` handler — the
+    // old `.localhost`-only extractor dropped these requests.
+    let resp = dispatch_https_intercept_sync(
+      "https://asset.mydomain/x",
+      "w1",
+      &https_test_handler("asset", true),
     );
+    assert!(resp.handled);
+    assert_eq!(resp.status, 201);
+    assert_eq!(resp.mime_type, "application/json");
   }
 
   #[test]
-  fn extract_protocol_from_https_url_empty_path() {
-    assert_eq!(
-      extract_protocol_from_https_url("https://tauri.localhost"),
-      Some("tauri")
-    );
-  }
+  fn https_intercept_reverts_to_original_scheme_and_host() {
+    // The handler must receive the reverted custom-scheme URL, host intact.
+    let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let seen_handler = Arc::clone(&seen);
+    let handler: ProtocolHandler = Box::new(move |_id, req, responder| {
+      *seen_handler.lock().unwrap() = Some(req.uri().to_string());
+      let resp = http::Response::builder()
+        .status(200)
+        .body(Vec::new())
+        .unwrap();
+      responder.respond(resp);
+    });
+    let mut protocols: HashMap<String, SharedProtocolHandler> = HashMap::new();
+    protocols.insert("asset".into(), Arc::new(SendSyncBox(handler)));
 
-  #[test]
-  fn extract_protocol_from_https_url_trailing_slash() {
+    let resp = dispatch_https_intercept_sync("https://asset.mydomain/x?y=1", "w1", &protocols);
+    assert!(resp.handled);
     assert_eq!(
-      extract_protocol_from_https_url("https://tauri.localhost/"),
-      Some("tauri")
+      *seen.lock().unwrap(),
+      Some("asset://mydomain/x?y=1".to_string())
     );
   }
 
@@ -1448,6 +1511,7 @@ mod tests {
   // ─── S7 pure-transform batch: branches of dispatch_https_intercept_sync ────────
 
   fn https_test_handler(
+    protocol: &str,
     respond_inline: bool,
   ) -> HashMap<String, SharedProtocolHandler> {
     let mut m: HashMap<String, SharedProtocolHandler> = HashMap::new();
@@ -1463,7 +1527,7 @@ mod tests {
       // respond_inline=false → handler returns without calling responder
       // → non-blocking check finds None → passthrough (no 3s wait)
     });
-    m.insert("myproto".into(), Arc::new(SendSyncBox(handler)));
+    m.insert(protocol.into(), Arc::new(SendSyncBox(handler)));
     m
   }
 
@@ -1478,7 +1542,7 @@ mod tests {
     let resp = dispatch_https_intercept_sync(
       "https://unknown.localhost/p",
       "w1",
-      &https_test_handler(true),
+      &https_test_handler("myproto", true),
     );
     assert!(!resp.handled && resp.status == 0);
   }
@@ -1490,7 +1554,7 @@ mod tests {
     let resp = dispatch_https_intercept_sync(
       "https://myproto.localhost/a b",
       "w1",
-      &https_test_handler(true),
+      &https_test_handler("myproto", true),
     );
     assert!(!resp.handled && resp.status == 0);
   }
@@ -1500,7 +1564,7 @@ mod tests {
     let resp = dispatch_https_intercept_sync(
       "https://myproto.localhost/data",
       "w1",
-      &https_test_handler(true),
+      &https_test_handler("myproto", true),
     );
     assert!(resp.handled);
     assert_eq!(resp.status, 201);
@@ -1515,7 +1579,7 @@ mod tests {
     let resp = dispatch_https_intercept_sync(
       "https://myproto.localhost/slow",
       "w1",
-      &https_test_handler(false),
+      &https_test_handler("myproto", false),
     );
     assert!(!resp.handled && resp.status == 0);
     assert!(start.elapsed() < std::time::Duration::from_secs(3));

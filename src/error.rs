@@ -77,8 +77,10 @@ pub enum Error {
   #[cfg(target_os = "android")]
   #[error("Activity not found")]
   ActivityNotFound,
+  #[cfg(target_env = "ohos")]
   #[error("Failed to initialize OpenHarmony webview: {0}")]
   OpenHarmonyInitError(String),
-  #[error("Failed to execute: {0}")]
+  #[cfg(target_env = "ohos")]
+  #[error("OpenHarmony webview operation failed: {0}")]
   OpenHarmonyWebviewError(String),
 }

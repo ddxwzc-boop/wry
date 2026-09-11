@@ -374,8 +374,6 @@ pub mod prelude {
 #[cfg(target_os = "android")]
 pub use android::JniHandle;
 
-#[cfg(target_env = "ohos")]
-pub use ohos::OhosWebviewHandle;
 #[cfg(target_os = "android")]
 use android::*;
 
@@ -414,7 +412,12 @@ use webview2_com::Microsoft::Web::WebView2::Win32::{
 #[cfg(target_env = "ohos")]
 pub(crate) mod ohos;
 #[cfg(target_env = "ohos")]
-pub use ohos::*;
+use ohos::*;
+// Targeted re-exports only (mirrors the android pattern of a private glob import
+// plus explicit public items): `InnerWebView` and `platform_webview_version`
+// stay crate-private — upstream never exposes them on any platform.
+#[cfg(target_env = "ohos")]
+pub use ohos::{OhosWebviewHandle, PdfConfig, WebviewBridgePlugin};
 
 use std::{borrow::Cow, collections::HashMap, path::PathBuf, rc::Rc};
 
@@ -930,7 +933,7 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// ## Platform-specific:
   ///
-  /// - **Android / iOS:** Unsupported.
+  /// - **Android / iOS / OpenHarmony:** Unsupported (silently ignored).
   pub fn with_back_forward_navigation_gestures(mut self, gesture: bool) -> Self {
     self.attrs.back_forward_navigation_gestures = gesture;
     self
@@ -963,6 +966,11 @@ impl<'a> WebViewBuilder<'a> {
   }
 
   /// Sets whether the WebView should be visible or not.
+  ///
+  /// ## Platform-specific:
+  ///
+  /// - **OpenHarmony**: Ignored — the webview is always created visible. Use
+  ///   [`WebView::set_visible`] after creation to hide it.
   pub fn with_visible(mut self, visible: bool) -> Self {
     self.attrs.visible = visible;
     self
@@ -1352,6 +1360,12 @@ impl<'a> WebViewBuilder<'a> {
   /// ## Platform-specific:
   ///
   /// - **Windows**: The closure is executed on a separate thread to prevent a deadlock.
+  /// - **OpenHarmony**: [`NewWindowFeatures::size`] and [`NewWindowFeatures::position`] are
+  ///   always `None` (ArkWeb does not expose the requested popup geometry), and
+  ///   [`NewWindowOpener`] is an empty struct with no webview reference. Returning
+  ///   [`NewWindowResponse::Create`] is treated like [`NewWindowResponse::Deny`] for the
+  ///   ArkWeb popup itself: tauri builds its own OS window for the new webview and cancels
+  ///   ArkWeb's popup, so `true` must never be returned for the `Create` case.
   ///
   /// [window.open]: https://developer.mozilla.org/en-US/docs/Web/API/Window/open
   pub fn with_new_window_req_handler(
@@ -1388,7 +1402,7 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// - Windows: Requires WebView2 Runtime version 101.0.1210.39 or higher, does nothing on older versions,
   ///   see <https://learn.microsoft.com/en-us/microsoft-edge/webview2/release-notes/archive?tabs=dotnetcsharp#10121039>
-  /// - **Android:** Unsupported yet.
+  /// - **Android / OpenHarmony:** Unsupported (silently ignored).
   pub fn with_incognito(mut self, incognito: bool) -> Self {
     self.attrs.incognito = incognito;
     self
@@ -1407,7 +1421,7 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// - **macOS**: Requires macOS 14.0+ and the `mac-proxy` feature flag to be enabled. Supports HTTP CONNECT and SOCKSv5 proxies.
   /// - **Windows / Linux**: Supports HTTP CONNECT and SOCKSv5 proxies.
-  /// - **Android / iOS:** Not supported.
+  /// - **Android / iOS / OpenHarmony:** Not supported (silently ignored).
   pub fn with_proxy_config(mut self, configuration: ProxyConfig) -> Self {
     self.attrs.proxy_config = Some(configuration);
     self
@@ -1417,7 +1431,7 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// ## Platform-specific:
   ///
-  /// - **macOS / Android / iOS:** Unsupported.
+  /// - **macOS / Android / iOS / OpenHarmony:** Unsupported (silently ignored).
   pub fn with_focused(mut self, focused: bool) -> Self {
     self.attrs.focused = focused;
     self
@@ -1440,7 +1454,7 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// ## Platform-specific
   ///
-  /// - **Linux / Windows / Android**: Unsupported. Workarounds like a pending WebLock transaction might suffice.
+  /// - **Linux / Windows / Android / OpenHarmony**: Unsupported (silently ignored). Workarounds like a pending WebLock transaction might suffice.
   /// - **iOS**: Supported since version 17.0+.
   /// - **macOS**: Supported since version 14.0+.
   ///
@@ -1471,7 +1485,7 @@ impl<'a> WebViewBuilder<'a> {
   ///   "Suggestions") may not honor `autocomplete="off"` attributes on input
   ///   elements in some cases. When this option is `false`, that autofill
   ///   behavior will be disabled.
-  /// - **macOS / Linux / Android / iOS**: Unsupported and ignored.
+  /// - **macOS / Linux / Android / iOS / OpenHarmony**: Unsupported and ignored.
   pub fn with_general_autofill_enabled(mut self, enabled: bool) -> Self {
     self.attrs.general_autofill_enabled = enabled;
     self
@@ -2247,19 +2261,6 @@ impl WebView {
     self.webview.clear_all_browsing_data()
   }
 
-  /// Create a PDF from the current webview content and save to the given path.
-  ///
-  /// Currently only supported on OpenHarmony.
-  #[cfg(target_env = "ohos")]
-  pub fn create_pdf(
-    &self,
-    path: &str,
-    config: Option<PdfConfig>,
-    callback: Box<dyn Fn(bool) + Send + 'static>,
-  ) -> Result<()> {
-    self.webview.create_pdf(path, config, callback)
-  }
-
   pub fn bounds(&self) -> Result<Rect> {
     self.webview.bounds()
   }
@@ -2582,6 +2583,24 @@ pub trait WebViewExtOhos {
   /// Returns the OHOS webview handle for accessing platform-specific APIs
   /// (e.g., `web_page_snapshot`).
   fn webview_handle(&self) -> OhosWebviewHandle;
+  /// Create a PDF from the current webview content and save to the given path.
+  ///
+  /// The bridge API uses fixed A4 settings when `config` is `None`
+  /// (8.27x11.69in, zero margins, shouldPrintBackground=true).
+  ///
+  /// `callback` receives `true` when the PDF was written to `path`.
+  fn create_pdf(
+    &self,
+    path: &str,
+    config: Option<PdfConfig>,
+    callback: Box<dyn Fn(bool) + Send + 'static>,
+  ) -> Result<()>;
+  /// Disposes a webview that was created as a child (`new_as_child`).
+  ///
+  /// Sends the remove op to the bridge (no-op for non-child webviews) and
+  /// marks the webview disposed so the `Drop` implementation does not send a
+  /// duplicate remove.
+  fn dispose_child(&self);
 }
 
 #[cfg(target_env = "ohos")]
@@ -2589,11 +2608,17 @@ impl WebViewExtOhos for WebView {
   fn webview_handle(&self) -> OhosWebviewHandle {
     self.webview.handle()
   }
-}
 
-#[cfg(target_env = "ohos")]
-impl WebView {
-  pub fn dispose_child(&self) {
+  fn create_pdf(
+    &self,
+    path: &str,
+    config: Option<PdfConfig>,
+    callback: Box<dyn Fn(bool) + Send + 'static>,
+  ) -> Result<()> {
+    self.webview.create_pdf(path, config, callback)
+  }
+
+  fn dispose_child(&self) {
     self.webview.dispose_child();
   }
 }

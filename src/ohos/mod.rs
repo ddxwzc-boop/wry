@@ -23,10 +23,31 @@ use openharmony_ability_plugin_webview::{
 /// registering it, `create` fails with "not installed for '<module>'".
 pub use openharmony_ability_plugin_webview::WebviewBridgePlugin;
 
-/// Configuration for PDF generation. The bridge API uses fixed A4 settings
-/// (8.27x11.69in, zero margins, shouldPrintBackground=true), but this struct
-/// is retained for API compatibility with the wry public interface and
-/// `tauri-runtime-wry` which constructs it from `tauri_runtime::PdfConfig`.
+/// Sets up the synchronous webview-cookie bridge (`ohos.webview-cookie`) used
+/// by main-thread `cookies_for_url` calls: registers the plugin on the app and
+/// caches the app handle for the sync calls. Call once during OHOS app setup —
+/// mirrors `tray_icon::set_ohos_app`.
+///
+/// The ArkTS counterpart (`WebviewCookiePlugin`) must be present in the host
+/// Ability's `bridgePlugins` list; without it the main-thread cookie fetch
+/// fails with an explicit bridge error (no silent empty results).
+pub fn set_ohos_app(app: openharmony_ability::OpenHarmonyApp) {
+  if let Err(e) = openharmony_ability_plugin_webview::set_cookie_sync_app(&app) {
+    log::error!(
+      "[wry] failed to set up the webview-cookie sync bridge: {}",
+      e
+    );
+  }
+}
+
+/// Configuration for PDF generation. All fields are optional; when a field is
+/// `None` the ArkTS side falls back to its defaults (A4 8.27×11.69in, zero
+/// margins, background printing on). Provided values are forwarded through the
+/// bridge (`WebviewPdfConfig`) and mapped per-field into ArkWeb's
+/// `PdfConfiguration` (width/height in inches) — see WebviewPlugin.ets
+/// `createPdf`. Note: `scale` is accepted for API compatibility but has no
+/// ArkWeb counterpart (`PdfConfiguration` has no scale field) and is dropped
+/// on the ArkTS side.
 pub struct PdfConfig {
   pub width: Option<f64>,
   pub height: Option<f64>,
@@ -919,7 +940,8 @@ impl InnerWebView {
     Ok(())
   }
 
-  // Pattern D: blocking-from-worker — cookies
+  // Pattern D: blocking-from-worker (worker threads) / sync bridge (main
+  // thread) — cookies
   pub fn cookies(&self) -> Result<Vec<Cookie<'static>>> {
     let url = self.url_cache.lock().unwrap().clone();
     if url.is_empty() {
@@ -955,11 +977,17 @@ impl InnerWebView {
   }
 
   pub fn cookies_for_url(&self, url: &str) -> Result<Vec<Cookie<'static>>> {
-    // Pattern D: blocking-from-worker
-    // Main thread blocking would deadlock TSFN → degrade to empty
+    // Main thread: the async bridge is unusable here — its TSFN response needs
+    // this very thread to pump, so blocking on it would deadlock. Fetch
+    // synchronously through the dedicated `ohos.webview-cookie`
+    // MainThreadSync plugin (ArkTS `fetchCookieSync`) instead. Returns the
+    // real cookies rather than the old silent empty (issue #110).
     if std::thread::current().id() == self.runtime.main_thread_id() {
-      log::warn!("[wry] cookies_for_url called on main thread — returning empty (degraded)");
-      return Ok(vec![]);
+      let cookie_str = openharmony_ability_plugin_webview::cookies_for_url_on_main_thread(url)
+        .map_err(|e| {
+          Error::OpenHarmonyWebviewError(format!("cookies_for_url (main-thread sync bridge): {e}"))
+        })?;
+      return Ok(parse_cookie_string(&cookie_str));
     }
     let handle = match self.try_handle() {
       Some(h) => h,
@@ -978,17 +1006,7 @@ impl InnerWebView {
       // pattern; the forbidden variant is blocking the MAIN thread.
       .recv_timeout(std::time::Duration::from_secs(3))
       .map_err(|_| Error::OpenHarmonyWebviewError("cookies_for_url timed out".into()))?;
-    let cookies_data: Vec<Cookie<'static>> = cookie_str
-      .split(';')
-      .filter_map(|s| {
-        let s = s.trim();
-        if s.is_empty() {
-          return None;
-        }
-        Cookie::parse(s.to_string()).map(|c| c.into_owned()).ok()
-      })
-      .collect();
-    Ok(cookies_data)
+    Ok(parse_cookie_string(&cookie_str))
   }
 
   // Pattern A: fire-and-forget
@@ -1136,12 +1154,28 @@ impl Drop for InnerWebView {
 /// which reads `OH_NativeArkWeb_GetActiveWebEngineVersion` from `libohweb.so`
 /// (see that function's docs for the CAPI/dlopen rationale).
 ///
-/// This is deliberately NOT a bridge round-trip: the primary caller
-/// (tauri-runtime-wry's `webview_runtime_installed` probe in `Wry::new`)
-/// runs during app bootstrap — synchronously inside the NAPI `openharmony()`
-/// entry on the ArkTS main thread — so a bridge call (whose ArkTS handler
-/// needs that same thread) would deadlock. The C API reads the same engine
-/// state with no thread requirements.
+/// This is deliberately NOT a bridge round-trip: it must stay callable during
+/// app bootstrap — synchronously inside the NAPI `openharmony()` entry on the
+/// ArkTS main thread — where a bridge call (whose ArkTS handler needs that
+/// same thread) would deadlock. The C API reads the same engine state with no
+/// thread requirements.
+///
+/// Callers: wry's own `webview_version()` wrapper (behind the default
+/// `os-webview` feature, which tauri-runtime-wry's wry dependency enables)
+/// compiles on OHOS and forwards here. tauri-runtime-wry's
+/// `webview_runtime_installed` probe deliberately hardcodes `true` on OHOS
+/// and does NOT consult it (ArkWeb is an always-present system component,
+/// and on systems below API 20 this query degrades to `Err` BY DESIGN —
+/// wiring the probe to `webview_version().is_ok()` would fail-closed every
+/// `create_webview` on those devices); tauri's `webview_version` re-export
+/// chain is additionally cfg-excluded on OHOS. Beyond that wrapper this is
+/// public API surface for direct wry users on OHOS.
+///
+/// Format note: unlike the sibling platforms' dotted-numeric strings
+/// (webview2 `"120.0.2210.61"`-style), this returns a kernel-generation
+/// label (`"M114"`/`"M132"`/`"M144"`/`"ARKWEB_EVERGREEN"`/`"SYSTEM_DEFAULT"`
+/// /`"ArkWebEngineVersion(N)"`, plus an optional `" (evergreen)"` suffix).
+/// Downstream code must not parse it as semver.
 pub fn platform_webview_version() -> Result<String> {
   openharmony_ability_plugin_webview::arkweb_engine_version()
     .map_err(|e| Error::OpenHarmonyWebviewError(e.to_string()))
@@ -1347,6 +1381,22 @@ fn format_set_cookie_value(cookie: &Cookie<'_>) -> String {
     value.push_str(&format!("; SameSite={}", same_site));
   }
   value
+}
+
+/// Parses the raw `fetchCookieSync` string (`"k=v; k2=v2"`) into owned cookies.
+/// Shared by the worker-thread (async bridge) and main-thread (sync bridge)
+/// paths of `cookies_for_url`.
+fn parse_cookie_string(cookie_str: &str) -> Vec<Cookie<'static>> {
+  cookie_str
+    .split(';')
+    .filter_map(|s| {
+      let s = s.trim();
+      if s.is_empty() {
+        return None;
+      }
+      Cookie::parse(s.to_string()).map(|c| c.into_owned()).ok()
+    })
+    .collect()
 }
 
 #[cfg(test)]

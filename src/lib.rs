@@ -417,7 +417,7 @@ use ohos::*;
 // plus explicit public items): `InnerWebView` and `platform_webview_version`
 // stay crate-private — upstream never exposes them on any platform.
 #[cfg(target_env = "ohos")]
-pub use ohos::{OhosWebviewHandle, PdfConfig, WebviewBridgePlugin};
+pub use ohos::{set_ohos_app, OhosWebviewHandle, PdfConfig, WebviewBridgePlugin};
 
 use std::{borrow::Cow, collections::HashMap, path::PathBuf, rc::Rc};
 
